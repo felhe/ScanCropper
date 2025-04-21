@@ -1,6 +1,7 @@
 import io
 import math
 import os
+from typing import Union, List, Dict, Any
 
 import cv2
 import fitz  # PyMuPDF
@@ -13,7 +14,6 @@ os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
 
 class ScanCropper:
-
     def __init__(self, settings: Settings):
         self.settings = settings
         self.errors = 0
@@ -23,115 +23,119 @@ class ScanCropper:
         if self.settings.write_output:
             os.makedirs(settings.output_dir, exist_ok=True)
 
-    def convert_pdf_bytes_to_images(self, pdf_stream):
+    def _load_pdf_as_images(self, pdf_bytes: bytes) -> List[np.ndarray]:
         dpi = 600
-        doc = fitz.open(stream=pdf_stream, filetype="pdf")
-        images = []
+        zoom = dpi / 72.0
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        mat = fitz.Matrix(zoom, zoom)
 
-        for i in range(len(doc)):
-            zoom = dpi / 72
-            mat = fitz.Matrix(zoom, zoom)
-            pix = doc.get_page_pixmap(i, matrix=mat)
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
-            if pix.n == 4:
-                img = img[:, :, :3]
+            img = img[:, :, :3] if pix.n == 4 else img
             images.append(img)
 
         return images
 
-    def convert_pdf_path_to_images(self, pdf_path):
-        with open(pdf_path, "rb") as f:
-            return self.convert_pdf_bytes_to_images(f.read())
+    def _load_pdf_from_path(self, pdf_path: str) -> List[np.ndarray]:
+        with open(pdf_path, "rb") as file:
+            return self._load_pdf_as_images(file.read())
 
-    def get_candidate_regions(self, img, contours):
+    def _read_image_from_stream(self, stream: io.IOBase) -> np.ndarray:
+        file_bytes = np.asarray(bytearray(stream.read()), dtype=np.uint8)
+        return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    def _get_candidate_regions(self, img: np.ndarray, contours: List[np.ndarray]) -> List[Any]:
+        img_area = img.shape[0] * img.shape[1]
         roi = []
+
         for contour in contours:
             rect = cv2.minAreaRect(contour)
             box = cv2.boxPoints(rect)
-            roi.append([box, rect, cv2.contourArea(box)])
-        roi = sorted(roi, key=lambda b: b[2], reverse=True)
+            area = cv2.contourArea(box)
+            if (area / img_area) > 0.05:
+                roi.append((box, rect, area))
 
-        img_area = img.shape[0] * img.shape[1]
-        return [b for b in roi if (b[2] / img_area) > 0.05]
+        return sorted(roi, key=lambda r: r[2], reverse=True)
 
-    def rotate_image(self, img, angle, center):
+    def _rotate_image(self, img: np.ndarray, angle: float, center: tuple) -> np.ndarray:
         (h, w) = img.shape[:2]
         mat = cv2.getRotationMatrix2D(center, angle, 1.0)
         return cv2.warpAffine(img, mat, (w, h), flags=cv2.INTER_LINEAR)
 
-    def rotate_box(self, box, angle, center):
+    def _rotate_box(self, box: np.ndarray, angle: float, center: tuple) -> np.ndarray:
         rad = -angle * self.settings.deg_to_rad
-        sine = math.sin(rad)
-        cosine = math.cos(rad)
-        rotBox = []
-        for p in box:
-            p[0] -= center[0]
-            p[1] -= center[1]
-            rot_x = p[0] * cosine - p[1] * sine
-            rot_y = p[0] * sine + p[1] * cosine
-            p[0] = rot_x + center[0]
-            p[1] = rot_y + center[1]
-            rotBox.append(p)
-        return np.array(rotBox)
+        sine, cosine = math.sin(rad), math.cos(rad)
+        rot_box = []
 
-    def get_center(self, box):
-        x_vals = [i[0] for i in box]
-        y_vals = [i[1] for i in box]
-        return ((max(x_vals) + min(x_vals)) / 2, (max(y_vals) + min(y_vals)) / 2)
+        for point in box:
+            dx, dy = point[0] - center[0], point[1] - center[1]
+            rot_x = dx * cosine - dy * sine + center[0]
+            rot_y = dx * sine + dy * cosine + center[1]
+            rot_box.append([rot_x, rot_y])
 
-    def clip_scans(self, img, candidates):
+        return np.array(rot_box, dtype=np.float32)
+
+    def _get_center(self, box: np.ndarray) -> tuple:
+        x_vals, y_vals = box[:, 0], box[:, 1]
+        return (x_vals.max() + x_vals.min()) / 2, (y_vals.max() + y_vals.min()) / 2
+
+    def _clip_scans(self, img: np.ndarray, candidates: List[Any]) -> List[np.ndarray]:
         scans = []
-        for roi in candidates:
-            rect = roi[1]
-            box = np.intp(roi[0])
+
+        for box, rect, _ in candidates:
             angle = rect[2]
             if angle < -45:
                 angle += 90
-            center = self.get_center(box)
-            rotIm = self.rotate_image(img, angle, center)
-            rotBox = self.rotate_box(box, angle, center)
-            x_vals = [int(i[0]) for i in rotBox]
-            y_vals = [int(i[1]) for i in rotBox]
+
+            box = np.intp(box)
+            center = self._get_center(box)
+            rotated_img = self._rotate_image(img, angle, center)
+            rotated_box = self._rotate_box(box, angle, center)
+
+            x_vals = np.clip(rotated_box[:, 0].astype(int), 0, img.shape[1])
+            y_vals = np.clip(rotated_box[:, 1].astype(int), 0, img.shape[0])
+
             try:
-                scans.append(rotIm[min(y_vals):max(y_vals), min(x_vals):max(x_vals)])
-            except IndexError:
-                print("Error: Cropping failed, likely due to bounds.")
+                cropped = rotated_img[min(y_vals):max(y_vals), min(x_vals):max(x_vals)]
+                scans.append(cropped)
+            except Exception as e:
+                print(f"Error cropping scan: {e}")
                 self.errors += 1
+
         return scans
 
-    def find_scans(self, img):
-        blur = cv2.medianBlur(img, self.settings.blur)
-        grey = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
-        _, thr = cv2.threshold(grey, self.settings.thresh, self.settings.max, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        roi = self.get_candidate_regions(img, contours)
-        return self.clip_scans(img, roi)
+    def _find_scans(self, img: np.ndarray) -> List[np.ndarray]:
+        blurred = cv2.medianBlur(img, self.settings.blur)
+        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, self.settings.thresh, self.settings.max, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    def read_image_from_stream(self, stream):
-        file_bytes = np.asarray(bytearray(stream.read()), dtype=np.uint8)
-        return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        candidates = self._get_candidate_regions(img, contours)
+        return self._clip_scans(img, candidates)
 
-    def process_input(self, source, name_hint="input"):
+    def process_input(self, source: Union[str, io.IOBase], name_hint: str = "input") -> List[np.ndarray]:
         self.images += 1
 
         if isinstance(source, str):
-            # File path
             if source.lower().endswith('.pdf'):
-                imgs = self.convert_pdf_path_to_images(source)
+                imgs = self._load_pdf_from_path(source)
             else:
                 img = cv2.imread(source)
                 imgs = [img] if img is not None else []
-        elif isinstance(source, io.BytesIO) or hasattr(source, 'read'):
-            # File-like object
+
+        elif hasattr(source, 'read'):
             header = source.read(4)
             source.seek(0)
+
             if header.startswith(b'%PDF'):
-                imgs = self.convert_pdf_bytes_to_images(source.read())
+                imgs = self._load_pdf_as_images(source.read())
             else:
-                img = self.read_image_from_stream(source)
+                img = self._read_image_from_stream(source)
                 imgs = [img] if img is not None else []
         else:
-            raise ValueError("Unsupported input type. Must be path or file-like object.")
+            raise ValueError("Unsupported input type. Must be file path or file-like object.")
 
         all_scans = []
         for i, img in enumerate(imgs):
@@ -139,7 +143,7 @@ class ScanCropper:
                 print("Invalid image data.")
                 continue
 
-            scans = self.find_scans(img)
+            scans = self._find_scans(img)
             for j, scan in enumerate(scans):
                 if scan is None or not scan.size:
                     print(f"Skipping empty scan {j} in {name_hint}")
@@ -149,29 +153,28 @@ class ScanCropper:
                 self.scans += 1
 
                 if self.settings.write_output:
-                    fname = f"{name_hint}_{i}_{j}"
                     ext = 'jpg' if self.settings.output_format == 'jpg' else 'png'
-                    out_path = os.path.join(self.settings.output_dir, f"{fname}.{ext}")
+                    filename = f"{name_hint}_{i}_{j}.{ext}"
+                    output_path = os.path.join(self.settings.output_dir, filename)
                     params = [int(cv2.IMWRITE_JPEG_QUALITY), 100] if ext == 'jpg' else []
-                    cv2.imwrite(out_path, scan, params)
-                    print(f"Saved scan to {out_path}")
+                    cv2.imwrite(output_path, scan, params)
+                    print(f"Saved scan to {output_path}")
 
         return all_scans
 
-    def process_inputs(self, sources: list):
+    def process_inputs(self, sources: List[Union[str, io.IOBase]]) -> Dict[str, List[np.ndarray]]:
         results = {}
         for source in sources:
             name_hint = os.path.basename(source) if isinstance(source, str) else "stream"
-            scans = self.process_input(source, name_hint=name_hint)
-            results[name_hint] = scans
+            results[name_hint] = self.process_input(source, name_hint=name_hint)
         return results
 
 
 def main():
     settings = ArgParser.parse()
     cropper = ScanCropper(settings)
-    input_paths = [os.path.join(settings.input_dir, f) for f in os.listdir(settings.input_dir)]
-    cropper.process_inputs(input_paths)
+    input_files = [os.path.join(settings.input_dir, f) for f in os.listdir(settings.input_dir)]
+    cropper.process_inputs(input_files)
 
 
 if __name__ == '__main__':
