@@ -1,5 +1,5 @@
 import argparse
-from settings import Settings
+from .settings import Settings
 
 class ArgParser:
 
@@ -57,4 +57,4 @@ class ArgParser:
         if args.dir is None or args.odir is None:
             raise Exception("Input and Output directory must be specified")
 
-        return Settings(args.threads, args.thresh, args.blur, args.scale, args.dir, args.odir, args.output_file_name_prefix, args.manual_name, args.manual_metadata, args.output_format)
+        return Settings(args.threads, args.thresh, args.blur, args.scale, args.dir, args.odir, args.output_file_name_prefix, args.manual_name, args.manual_metadata, args.output_format, True)
